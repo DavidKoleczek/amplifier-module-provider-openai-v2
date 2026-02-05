@@ -47,6 +47,7 @@ from openai.types.shared_params.reasoning import Reasoning
 from pydantic import BaseModel
 
 from amplifier_core import ConfigField, ModelInfo, ModuleCoordinator, ProviderInfo
+from amplifier_core.content_models import TextContent, ThinkingContent, ToolCallContent
 from amplifier_core.message_models import (
     ChatRequest,
     ChatResponse,
@@ -71,6 +72,18 @@ from ._constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class UIChatResponse(ChatResponse):
+    """ChatResponse with additional fields for streaming UI compatibility.
+
+    The orchestrator reads `content_blocks` (dataclass-based ContentBlock objects
+    from content_models.py) to emit content_block:start/end hook events that the
+    streaming UI uses to display thinking, text, and tool calls.
+    """
+
+    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    text: str | None = None
 
 
 class OpenAIRequest(BaseModel):
@@ -652,8 +665,12 @@ class OpenAIProvider:
 
         return schema
 
-    def _convert_from_openai_response(self, openai_response: Response) -> ChatResponse:
+    def _convert_from_openai_response(self, openai_response: Response) -> UIChatResponse:
+        # content_blocks: Pydantic models for conversation history / round-tripping
         content_blocks: list[ContentBlockUnion] = []
+        # event_blocks: dataclass ContentBlock objects for streaming UI hook events
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []
+        text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         metadata = {"created_by": "openai", "raw_response": openai_response.model_dump(mode="json")}
         name = None
@@ -670,12 +687,15 @@ class OpenAIProvider:
                         content=[message.encrypted_content, message.id],
                     )
                     content_blocks.append(thinking_block)
+                    event_blocks.append(ThinkingContent(text=summary))
                 case "message":
                     for content in message.content:
                         match content.type:
                             case "output_text":
                                 text_block = TextBlock(type="text", text=content.text)
                                 content_blocks.append(text_block)
+                                event_blocks.append(TextContent(text=content.text))
+                                text_parts.append(content.text)
                 case "function_call":
                     tool_call_id = message.call_id
                     name = message.name
@@ -693,6 +713,7 @@ class OpenAIProvider:
                     )
                     content_blocks.append(tool_call_block)
                     tool_calls.append(tool_call_obj)
+                    event_blocks.append(ToolCallContent(id=tool_call_id, name=name, arguments=arguments))
                 case "web_search_call":
                     tool_call_name = "web_search"
                     call_id = message.id
@@ -738,6 +759,7 @@ Importantly, the web_search tool definition may have changed, including the name
                     content_blocks.append(tool_call_block)
                     tool_calls.append(tool_call_obj)
                     content_blocks.append(tool_result_block)
+                    event_blocks.append(ToolCallContent(id=call_id, name=tool_call_name, arguments=arguments))
 
         if openai_response.usage is not None:
             usage = Usage(
@@ -747,12 +769,17 @@ Importantly, the web_search tool definition may have changed, including the name
             )
         else:
             usage = None
+
+        combined_text = "\n\n".join(text_parts) if text_parts else None
+        
         # Responses API does not support finish_reason
-        chat_response = ChatResponse(
+        chat_response = UIChatResponse(
             content=content_blocks,
             tool_calls=tool_calls,
             usage=usage,
             metadata=metadata,
+            content_blocks=event_blocks if event_blocks else None,
+            text=combined_text,
         )
         return chat_response
 
