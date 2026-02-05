@@ -3,7 +3,7 @@ OpenAI provider module for Amplifier.
 Integrates with OpenAI's Responses API.
 """
 
-__all__ = ["mount", "OpenAIProvider"]
+__all__ = ["mount", "OpenAIProvider", "RequestTimeoutError"]
 
 # Amplifier module metadata
 __amplifier_module_type__ = "provider"
@@ -39,6 +39,8 @@ from openai.types.responses.response_input_text_param import ResponseInputTextPa
 from openai.types.responses.response_reasoning_item_param import (
     ResponseReasoningItemParam,
 )
+from openai.types.responses.response_reasoning_item_param import Summary
+from openai.types.responses.response_function_web_search import ActionFind, ActionOpenPage, ActionSearch
 from openai.types.responses.function_tool_param import FunctionToolParam
 from openai.types.responses.tool_param import ToolParam
 from openai.types.shared_params.reasoning import Reasoning
@@ -56,6 +58,7 @@ from amplifier_core.message_models import (
     Usage,
     ToolSpec,
     ContentBlockUnion,
+    ToolResultBlock,
 )
 
 from ._constants import (
@@ -63,6 +66,8 @@ from ._constants import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
+    DEFAULT_TIMEOUT,
+    DEFAULT_WEB_SEARCH,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +91,10 @@ class OpenAIRequest(BaseModel):
 
 class ContextLimitExceededError(Exception):
     """Raised when the input context exceeds the provider's limit."""
+
+
+class RequestTimeoutError(Exception):
+    """Raised when the request exceeds the configured timeout."""
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -148,7 +157,13 @@ class OpenAIProvider:
             "debug_truncate_length", DEFAULT_DEBUG_TRUNCATE_LENGTH
         )  # Max chars before truncation in debug logs
         self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
-        self.background = False
+
+        # Enable built-in web search tool (adds web_search_call results to include)
+        self.web_search = self.config.get("web_search", DEFAULT_WEB_SEARCH)
+        # Try background mode for very long requests that may exceed HTTP timeout limits
+        self.background = self.config.get("background", False)
+        # Request timeout in seconds (default 20 min); set to 0 or null to disable
+        self.timeout: float | None = self.config.get("timeout", DEFAULT_TIMEOUT) or None
 
     @property
     def client(self) -> AsyncOpenAI:
@@ -290,6 +305,9 @@ class OpenAIProvider:
 
         Returns:
             ChatResponse with content blocks, tool calls, usage
+
+        Raises:
+            RequestTimeoutError: If the request exceeds the configured timeout.
         """
         openai_request = self._convert_to_openai_request(request, **kwargs)
         openai_request = self._remove_unused_tool_calls(openai_request)
@@ -299,64 +317,17 @@ class OpenAIProvider:
 
         start_time = time.time()
         try:
-            if self.background:
-                response = await self.client.responses.create(
-                    model=openai_request.model,
-                    input=openai_request.input,
-                    include=openai_request.include if openai_request.include is not None else omit,
-                    instructions=openai_request.instructions if openai_request.instructions is not None else omit,
-                    max_output_tokens=openai_request.max_output_tokens
-                    if openai_request.max_output_tokens is not None
-                    else omit,
-                    parallel_tool_calls=openai_request.parallel_tool_calls
-                    if openai_request.parallel_tool_calls is not None
-                    else omit,
-                    reasoning=openai_request.reasoning if openai_request.reasoning is not None else omit,
-                    temperature=openai_request.temperature if openai_request.temperature is not None else omit,
-                    text=openai_request.text if openai_request.text is not None else omit,
-                    tool_choice=openai_request.tool_choice if openai_request.tool_choice is not None else omit,
-                    tools=openai_request.tools if openai_request.tools is not None else omit,
-                    truncation=openai_request.truncation if openai_request.truncation is not None else omit,
-                    store=True,
-                    stream=False,
-                    background=self.background,
-                )
-                while response.status in {"queued", "in_progress"}:
-                    await asyncio.sleep(2)
-                    response = await self.client.responses.retrieve(response.id)
-            else:
-                response_stream = await self.client.responses.create(
-                    model=openai_request.model,
-                    input=openai_request.input,
-                    include=openai_request.include if openai_request.include is not None else omit,
-                    instructions=openai_request.instructions if openai_request.instructions is not None else omit,
-                    max_output_tokens=openai_request.max_output_tokens
-                    if openai_request.max_output_tokens is not None
-                    else omit,
-                    parallel_tool_calls=openai_request.parallel_tool_calls
-                    if openai_request.parallel_tool_calls is not None
-                    else omit,
-                    reasoning=openai_request.reasoning if openai_request.reasoning is not None else omit,
-                    temperature=openai_request.temperature if openai_request.temperature is not None else omit,
-                    text=openai_request.text if openai_request.text is not None else omit,
-                    tool_choice=openai_request.tool_choice if openai_request.tool_choice is not None else omit,
-                    tools=openai_request.tools if openai_request.tools is not None else omit,
-                    truncation=openai_request.truncation if openai_request.truncation is not None else omit,
-                    store=False,
-                    stream=True,
-                    background=False,
-                )
-                response: Response | None = None
-                async for event in response_stream:
-                    if isinstance(event, ResponseCompletedEvent):
-                        response = event.response
-                        break
-                if response is None:
-                    raise RuntimeError("Response stream ended without a completed response event.")
+            response = await asyncio.wait_for(
+                self._execute_api_request(openai_request),
+                timeout=self.timeout,
+            )
 
             elapsed_ms = int((time.time() - start_time) * 1000)
-
             await self._emit_response_hooks(response, elapsed_ms)
+
+        except asyncio.TimeoutError:
+            elapsed_s = time.time() - start_time
+            raise RequestTimeoutError(f"OpenAI request timed out after {elapsed_s:.1f}s (limit: {self.timeout}s)")
 
         except openai.BadRequestError as e:
             if e.code == "context_length_exceeded":
@@ -366,6 +337,65 @@ class OpenAIProvider:
         final_response = self._convert_from_openai_response(response)
         return final_response
 
+    async def _execute_api_request(self, openai_request: OpenAIRequest) -> Response:
+        """Execute the OpenAI API request (background polling or streaming)."""
+        if self.background:
+            response = await self.client.responses.create(
+                model=openai_request.model,
+                input=openai_request.input,
+                include=openai_request.include if openai_request.include is not None else omit,
+                instructions=openai_request.instructions if openai_request.instructions is not None else omit,
+                max_output_tokens=openai_request.max_output_tokens
+                if openai_request.max_output_tokens is not None
+                else omit,
+                parallel_tool_calls=openai_request.parallel_tool_calls
+                if openai_request.parallel_tool_calls is not None
+                else omit,
+                reasoning=openai_request.reasoning if openai_request.reasoning is not None else omit,
+                temperature=openai_request.temperature if openai_request.temperature is not None else omit,
+                text=openai_request.text if openai_request.text is not None else omit,
+                tool_choice=openai_request.tool_choice if openai_request.tool_choice is not None else omit,
+                tools=openai_request.tools if openai_request.tools is not None else omit,
+                truncation=openai_request.truncation if openai_request.truncation is not None else omit,
+                store=True,
+                stream=False,
+                background=self.background,
+            )
+            while response.status in {"queued", "in_progress"}:
+                await asyncio.sleep(2)
+                response = await self.client.responses.retrieve(response.id)
+            return response
+        else:
+            response_stream = await self.client.responses.create(
+                model=openai_request.model,
+                input=openai_request.input,
+                include=openai_request.include if openai_request.include is not None else omit,
+                instructions=openai_request.instructions if openai_request.instructions is not None else omit,
+                max_output_tokens=openai_request.max_output_tokens
+                if openai_request.max_output_tokens is not None
+                else omit,
+                parallel_tool_calls=openai_request.parallel_tool_calls
+                if openai_request.parallel_tool_calls is not None
+                else omit,
+                reasoning=openai_request.reasoning if openai_request.reasoning is not None else omit,
+                temperature=openai_request.temperature if openai_request.temperature is not None else omit,
+                text=openai_request.text if openai_request.text is not None else omit,
+                tool_choice=openai_request.tool_choice if openai_request.tool_choice is not None else omit,
+                tools=openai_request.tools if openai_request.tools is not None else omit,
+                truncation=openai_request.truncation if openai_request.truncation is not None else omit,
+                store=False,
+                stream=True,
+                background=False,
+            )
+            response: Response | None = None
+            async for event in response_stream:
+                if isinstance(event, ResponseCompletedEvent):
+                    response = event.response
+                    break
+            if response is None:
+                raise RuntimeError("Response stream ended without a completed response event.")
+            return response
+
     def _convert_to_openai_request(self, request: ChatRequest, **kwargs: Any) -> OpenAIRequest:
         """Converts Amplifier Core's ChatRequest to OpenAIRequest which wraps OpenAI's Responses API parameters."""
         messages = self._convert_to_response_input_item_param(request.messages)
@@ -373,15 +403,24 @@ class OpenAIProvider:
         # Get model from kwargs (passed by orchestrator) or fall back to default
         model = kwargs.get("model", self.default_model)
 
+        include: list[ResponseIncludable] = ["reasoning.encrypted_content"]
+        if self.web_search:
+            include.extend(["web_search_call.results", "web_search_call.action.sources"])
+
+        tools: list[ToolParam] | None = self._convert_to_tool_param(request.tools) if request.tools else None
+        if self.web_search:
+            web_search_tool: ToolParam = {"type": "web_search"}  # type: ignore[typeddict-item]
+            tools = [*tools, web_search_tool] if tools else [web_search_tool]
+
         openai_request = OpenAIRequest(
             input=messages,
             model=model,
-            include=["reasoning.encrypted_content"],
+            include=include,
             reasoning={"effort": self.reasoning, "summary": "auto"},
-            tools=self._convert_to_tool_param(request.tools) if request.tools else None,
+            tools=tools,
             max_output_tokens=request.max_output_tokens,
             truncation="auto",
-            background=False,
+            background=self.background if self.background else None,
         )
         return openai_request
 
@@ -447,24 +486,23 @@ class OpenAIProvider:
                     if isinstance(message.content, str):
                         assistant_items.append(EasyInputMessageParam(role="assistant", content=message.content))
                     elif isinstance(message.content, list):
-                        metadata = message.metadata or {}
-                        created_by = metadata.get("created_by", "")
                         for content_block in message.content:
                             match content_block.type:
                                 case "thinking":
-                                    if content_block.content is None:
+                                    # This is only supported for reasoning items created by OpenAI
+                                    # Ideally, we would detect if the reasoning item was created by OpenAI, and ignore otherwise.
+                                    if content_block.content is None or len(content_block.content) < 2:
                                         continue
                                     encrypted_content = content_block.content[0]
                                     reasoning_id = content_block.content[1]
-                                    if created_by == "openai":
-                                        assistant_items.append(
-                                            ResponseReasoningItemParam(
-                                                id=reasoning_id,
-                                                type="reasoning",
-                                                summary=[{"type": "summary_text", "text": content_block.thinking}],
-                                                encrypted_content=encrypted_content,
-                                            )
+                                    assistant_items.append(
+                                        ResponseReasoningItemParam(
+                                            id=reasoning_id,
+                                            type="reasoning",
+                                            summary=[Summary(text=content_block.thinking, type="summary_text")],
+                                            encrypted_content=encrypted_content,
                                         )
+                                    )
                                 case "text":
                                     aggregated_text = content_block.text
                                     assistant_items.append(
@@ -623,8 +661,8 @@ class OpenAIProvider:
         for message in openai_response.output:
             match message.type:
                 case "reasoning":
-                    summary = [x.text for x in message.summary if message.summary is not None]
-                    summary = "\n".join(summary)
+                    summary_items = list(message.summary) if message.summary is not None else []
+                    summary = "\n".join(x.text for x in summary_items)
                     thinking_block = ThinkingBlock(
                         type="thinking",
                         thinking=summary,
@@ -655,6 +693,51 @@ class OpenAIProvider:
                     )
                     content_blocks.append(tool_call_block)
                     tool_calls.append(tool_call_obj)
+                case "web_search_call":
+                    tool_call_name = "web_search"
+                    call_id = message.id
+                    action = message.action
+                    base_message = """The complete result of this tool call was removed. Please call a web search tool if you need the data again. \
+Importantly, the web_search tool definition may have changed, including the name of the tool itself. Be sure to use the latest definition."""
+
+                    if isinstance(action, ActionSearch):
+                        arguments = {"type": "search", "query": action.query}
+                        if action.sources:
+                            sources_list = [source.url for source in action.sources]
+                            output_content = (
+                                base_message + "\n\nSources found:\n" + "\n".join(f"- {url}" for url in sources_list)
+                            )
+                        else:
+                            output_content = base_message
+                    elif isinstance(action, ActionOpenPage):
+                        arguments = {"type": "open_page", "url": action.url}
+                        output_content = base_message
+                    elif isinstance(action, ActionFind):
+                        arguments = {"type": "find", "pattern": action.pattern, "url": action.url}
+                        output_content = base_message
+                    else:
+                        arguments = {}
+                        output_content = base_message
+
+                    tool_call_obj = ToolCall(
+                        id=call_id,
+                        name=tool_call_name,
+                        arguments=arguments,
+                    )
+                    tool_call_block = ToolCallBlock(
+                        type="tool_call",
+                        id=call_id,
+                        name=tool_call_name,
+                        input=arguments,
+                    )
+                    tool_result_block = ToolResultBlock(
+                        type="tool_result",
+                        tool_call_id=call_id,
+                        output=output_content,
+                    )
+                    content_blocks.append(tool_call_block)
+                    tool_calls.append(tool_call_obj)
+                    content_blocks.append(tool_result_block)
 
         if openai_response.usage is not None:
             usage = Usage(

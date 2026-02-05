@@ -9,5 +9,11 @@ DEFAULT_MODEL = "gpt-5.2-codex"
 DEFAULT_MAX_TOKENS = 64_000
 DEFAULT_REASONING_EFFORT = "high"  # minimal|low|medium|high|xhigh
 
+# Feature flags
+DEFAULT_WEB_SEARCH = True  # Enable built-in web search tool
+
+# Request timeout
+DEFAULT_TIMEOUT = 1200.0  # 20 minutes
+
 # Debug logging configuration
 DEFAULT_DEBUG_TRUNCATE_LENGTH = 2000  # Characters before truncation in debug logs

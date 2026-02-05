@@ -2,37 +2,12 @@
 
 OpenAI model integration for Amplifier via the Responses API.
 
-## Recommended Models
-
-| Model | Use Case |
-|-------|----------|
-| `gpt-5.2-codex` | Best for code generation and editing |
-| `gpt-5.2` | General purpose |
-| `gpt-5.2-pro` | Complex reasoning and analysis |
-
-Set `reasoning: high` for best results with all models.
 
 ## Prerequisites
 
 - **Python 3.11+**
 - **[uv](https://github.com/astral-sh/uv)**
 
-
-## Limitations
-
-### Not Yet Supported
-
-- Timeout configuration (coming soon)
-- Native web search/fetch (coming soon)
-- Background mode (needs testing)
-- Image support (TBD, limited ecosystem support)
-
-### Intentional Omissions
-
-- o-series models — prefer gpt-5.x or later
-- Tool repair — incomplete tool calls are removed instead
-- Temperature and similar parameters — not supported by Responses API
-- `store` parameter — always set to `False` to prevent confusion with stateful Responses API features, except if required by a future background mode
 
 ## Configuration
 
@@ -45,9 +20,19 @@ providers:
       max_tokens: 64000
       reasoning: high                   # Reasoning effort: minimal|low|medium|high|xhigh
       filtered: true                    # Filter to curated model list
+      web_search: true                  # Enable built-in web search tool
+      timeout: 1200                     # Request timeout in seconds (default 20 min, 0 to disable)
+      background: false                 # Background mode for very long requests
       debug: false                      # Enable debug events
       raw_debug: false                  # Enable raw API I/O logging
 ```
+
+- Recommended models are:
+  - `gpt-5.2-codex` for code tasks
+  - `gpt-5.2` for general tasks
+  - `gpt-5.2-pro` for complex reasoning where latency is not critical
+- Background mode (`background: true`) offloads the request to OpenAI's async pipeline; try this for very long-running requests that may exceed HTTP timeout limits.
+
 
 ### Debug Configuration
 
@@ -95,6 +80,16 @@ uv run pyright
 ```bash
 uv run pytest
 ```
+
+
+## Limitations
+
+- Image support (TBD, limited ecosystem support)
+- o-series models — prefer gpt-5.x or later
+- Tool repair — incomplete tool calls are removed instead
+- Temperature and similar parameters — not supported by Responses API
+- `store` parameter — always set to `False` unless background mode is enabled (which requires `store=True`)
+
 
 ## Contributing
 
