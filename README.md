@@ -2,6 +2,16 @@
 
 OpenAI model integration for Amplifier via the Responses API.
 
+## Recommended Models
+
+| Model | Use Case |
+|-------|----------|
+| `gpt-5.2-codex` | Best for code generation and editing |
+| `gpt-5.2` | General purpose |
+| `gpt-5.2-pro` | Complex reasoning and analysis |
+
+Set `reasoning: high` for best results with all models.
+
 ## Prerequisites
 
 - **Python 3.11+**
@@ -33,7 +43,7 @@ providers:
       base_url: null                    # Optional custom endpoint (null = OpenAI default)
       default_model: gpt-5.2-codex
       max_tokens: 64000
-      reasoning: medium                 # Reasoning effort: minimal|low|medium|high|xhigh
+      reasoning: high                   # Reasoning effort: minimal|low|medium|high|xhigh
       filtered: true                    # Filter to curated model list
       debug: false                      # Enable debug events
       raw_debug: false                  # Enable raw API I/O logging

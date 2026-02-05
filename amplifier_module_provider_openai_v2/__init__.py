@@ -63,7 +63,6 @@ from ._constants import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
-    DEEP_RESEARCH_MODELS,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,15 +150,6 @@ class OpenAIProvider:
         self.filtered = self.config.get("filtered", True)  # Filter to curated model list by default
         self.background = False
 
-        # Provider priority for selection (lower = higher priority)
-        self.priority = self.config.get("priority", 100)
-
-        # Track tool call IDs that have been repaired with synthetic results.
-        # This prevents infinite loops when the same missing tool results are
-        # detected repeatedly across LLM iterations (since synthetic results
-        # are injected into request.messages but not persisted to message store).
-        self._repaired_tool_ids: set[str] = set()
-
     @property
     def client(self) -> AsyncOpenAI:
         """Lazily initialize the OpenAI client on first access."""
@@ -217,8 +207,7 @@ class OpenAIProvider:
         """
         List available OpenAI models.
 
-        Queries the OpenAI API for available models and filters to GPT-5+ series
-        and deep research models.
+        Queries the OpenAI API for available models and filters to GPT-5+ series.
         Raises exception if API query fails (no fallback - caller handles empty lists).
         """
         # Query OpenAI models API - let exceptions propagate
@@ -230,36 +219,24 @@ class OpenAIProvider:
         for model in models_response.data:
             model_id = model.id
 
-            # Check if this is a deep research model
-            is_deep_research = model_id in DEEP_RESEARCH_MODELS or model_id.startswith(
-                ("o3-deep-research", "o4-mini-deep-research")
-            )
-
-            # Filter to GPT-5+ series models or deep research models
-            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6") or is_deep_research):
+            # Filter to GPT-5+ series models
+            if not (model_id.startswith("gpt-5") or model_id.startswith("gpt-6")):
                 continue
 
             # Skip dated versions when filtered (e.g., gpt-5-2025-08-07) - duplicates of aliases
-            # But always include deep research aliases (o3-deep-research, o4-mini-deep-research)
-            if self.filtered and not is_deep_research and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
+            if self.filtered and regex_module.search(r"-\d{4}-\d{2}-\d{2}$", model_id):
                 continue
 
             # Generate display name from model ID
             display_name = self._model_id_to_display_name(model_id)
 
             # Determine capabilities based on model type
-            if is_deep_research:
-                capabilities = ["deep_research", "web_search", "reasoning"]
-                context_window = 200000
-                max_output_tokens = 100000
-                defaults = {"max_tokens": 32768, "background": True}
-            else:
-                capabilities = ["tools", "reasoning", "streaming", "json_mode"]
-                if "mini" in model_id or "nano" in model_id:
-                    capabilities.append("fast")
-                context_window = 400000
-                max_output_tokens = 128000
-                defaults = {"max_tokens": 16384, "reasoning_effort": "none"}
+            capabilities = ["tools", "reasoning", "streaming", "json_mode"]
+            if "mini" in model_id or "nano" in model_id:
+                capabilities.append("fast")
+            context_window = 400000
+            max_output_tokens = 128000
+            defaults = {"max_tokens": 64_000, "reasoning_effort": "none"}
 
             models.append(
                 ModelInfo(
@@ -282,8 +259,6 @@ class OpenAIProvider:
             gpt-5.1 -> GPT 5.1
             gpt-5.1-codex -> GPT-5.1 codex
             gpt-5-mini -> GPT-5 mini
-            o3-deep-research -> o3 Deep Research
-            o4-mini-deep-research -> o4-mini Deep Research
         """
         # Known display name mappings
         display_names = {
@@ -293,24 +268,10 @@ class OpenAIProvider:
             "gpt-5.1-codex": "GPT-5.1 codex",
             "gpt-5.1-codex-max": "GPT-5.1 codex max",
             "gpt-5-mini": "GPT-5 mini",
-            "o3-deep-research": "o3 Deep Research",
-            "o3-deep-research-2025-06-26": "o3 Deep Research (2025-06-26)",
-            "o4-mini-deep-research": "o4-mini Deep Research",
-            "o4-mini-deep-research-2025-06-26": "o4-mini Deep Research (2025-06-26)",
         }
 
         if model_id in display_names:
             return display_names[model_id]
-
-        # Handle deep research model variants
-        if "deep-research" in model_id:
-            # Extract base model (o3, o4-mini, etc.) and format nicely
-            if model_id.startswith("o3-deep-research"):
-                suffix = model_id.replace("o3-deep-research", "")
-                return f"o3 Deep Research{suffix}"
-            if model_id.startswith("o4-mini-deep-research"):
-                suffix = model_id.replace("o4-mini-deep-research", "")
-                return f"o4-mini Deep Research{suffix}"
 
         # Generate from ID: capitalize GPT, keep rest lowercase
         if model_id.startswith("gpt-"):
